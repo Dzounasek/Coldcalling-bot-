@@ -25,6 +25,7 @@ import time
 from urllib.parse import urlparse, urljoin, quote
 
 import requests
+import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
@@ -37,6 +38,11 @@ from bs4 import BeautifulSoup
 st.set_page_config(
     page_title="Cold Call Ninja",
     page_icon="📞",
+    # Force the sidebar to always be open. Without this, Streamlit
+    # auto-collapses it on anything it thinks is a "narrow" viewport
+    # (a zoomed-in browser on an older laptop counts) - which is exactly
+    # the blank-page problem we're fixing here.
+    initial_sidebar_state="expanded",
 )
 
 # ----------------------------------------------------------------------------
@@ -287,60 +293,49 @@ def build_justice_url(ico: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# UI - HEADER
+# SIDEBAR - INPUT ONLY
 # ----------------------------------------------------------------------------
+# Keeps the input controls permanently visible and off the main pane, so
+# the results below start right at the top of the screen with nothing to
+# scroll past first.
 
-st.title("📞 Cold Call Prep Ninja")
-st.caption("Quick-fire prep for outbound calls: ad activity, phone numbers, and company info, in one shot.")
+with st.sidebar:
+    st.header("📞 Cold Call Ninja")
+    user_input = st.text_input(
+        "E-shop URL",
+        placeholder="alza.cz",
+        help="e.g., alza.cz or https://www.alza.cz",
+        label_visibility="collapsed",
+    )
+    submitted = st.button("🚀 Prep this call", type="primary", use_container_width=True)
 
-user_input = st.text_input(
-    "Enter the e-shop URL (e.g., alza.cz or https://www.alza.cz):",
-    placeholder="alza.cz",
-)
+# ----------------------------------------------------------------------------
+# MAIN AREA - COMPACT, EVERYTHING ON ONE SCREEN, NO SCROLLING
+# ----------------------------------------------------------------------------
+# Deliberately terse: no big title/caption banner, no dividers, no one
+# giant success/info box per item. Results are packed into small tables
+# so a full lookup fits on-screen without needing to scroll at all.
 
-submitted = st.button("🚀 Prep this call", type="primary")
-
-# Trigger on either pressing Enter in the text_input or clicking the button.
 if user_input and submitted:
-    st.divider()
 
     # --- URL PROCESSING -----------------------------------------------
     full_url = normalize_url(user_input)
     domain = extract_root_domain(full_url)
 
     if not domain:
-        st.error("⚠️ That doesn't look like a valid URL. Please check it and try again.")
+        st.error("⚠️ Invalid URL - please check it and try again.")
         st.stop()
 
-    st.markdown(f"**Target domain:** `{domain}`")
+    st.markdown(f"### {domain}")
 
-    # --- SECTION 1: META ADS LIBRARY -----------------------------------
-    st.subheader("1. Meta Ads Library")
-    with st.spinner("Building Ads Library link..."):
-        fb_url = build_facebook_ads_library_url(domain)
+    # --- ADS LIBRARY LINK -----------------------------------------------
+    # st.link_button is a single compact row (unlike a big custom HTML
+    # button), so it costs almost no vertical space.
+    fb_url = build_facebook_ads_library_url(domain)
+    st.link_button("🔎 Facebook Ads Library", fb_url, use_container_width=True)
 
-    st.markdown(
-        f"""
-        <a href="{fb_url}" target="_blank" style="
-            display: inline-block;
-            background-color: #1877F2;
-            color: white;
-            padding: 12px 24px;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: bold;
-            font-size: 16px;
-        ">🔎 Check Facebook Ads Library for "{domain}"</a>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.caption("Opens in a new tab. Look for active ads to gauge marketing spend.")
-
-    st.divider()
-
-    # --- SECTION 2: PHONE NUMBERS + COMPANY INFO -----------------------
-    st.subheader("2. Extracted Phone Numbers & Company Info")
-    with st.spinner(f"Crawling {domain} and common contact pages..."):
+    # --- CRAWL FOR PHONES + IČO -----------------------------------------
+    with st.spinner(f"Scanning {domain}..."):
         try:
             numbers, icos, errors, pages_ok = scrape_site_for_contact_info(full_url, domain)
         except Exception as exc:
@@ -350,53 +345,52 @@ if user_input and submitted:
             st.error(f"❌ Unexpected error while scraping: {exc}")
             numbers, icos, errors, pages_ok = set(), set(), [], 0
 
-    # --- Phone numbers ---
+    # --- PHONE NUMBERS: one compact table instead of a box per number ---
     if numbers:
-        st.success(f"✅ Found {len(numbers)} unique phone number(s):")
-        for number in sorted(numbers):
-            st.success(f"📱 {number}")
-    else:
-        st.warning(
-            "⚠️ No phone numbers found on the homepage or common contact pages. "
-            "The site may hide them behind JavaScript, a contact form, or bot protection."
+        st.dataframe(
+            pd.DataFrame({"📱 Phone numbers": sorted(numbers)}),
+            hide_index=True,
+            use_container_width=True,
         )
+    else:
+        st.warning("No phone numbers found.", icon="⚠️")
 
-    # --- IČO / company lookup ---
+    # --- IČO / COMPANY LOOKUP: one compact table with a clickable link ---
     if icos:
-        st.markdown("**🏢 Company registration number(s) found:**")
-        for ico in sorted(icos):
-            # Look up the official company name via ARES - fails quietly
-            # to None if the API is down or the IČO isn't recognized.
-            with st.spinner(f"Looking up IČO {ico} in ARES..."):
-                company_name = lookup_company_name_ares(ico)
+        with st.spinner("Looking up ARES..."):
+            rows = []
+            for ico in sorted(icos):
+                company_name = lookup_company_name_ares(ico) or "not found in ARES"
+                rows.append(
+                    {
+                        "IČO": ico,
+                        "Company": company_name,
+                        "Justice.cz": build_justice_url(ico),
+                    }
+                )
 
-            justice_url = build_justice_url(ico)
-
-            if company_name:
-                st.info(f"🏢 **IČO {ico}** — {company_name}")
-            else:
-                st.info(f"🏢 **IČO {ico}** — company name not found in ARES")
-
-            st.markdown(
-                f"[⚖️ Zobrazit jednatele ve Veřejném rejstříku (Justice.cz)]({justice_url})"
-            )
-    else:
-        st.warning(
-            "⚠️ No IČO (company registration number) found on the scanned pages. "
-            "Try checking the site's Terms & Conditions page manually."
+        st.dataframe(
+            pd.DataFrame(rows),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Justice.cz": st.column_config.LinkColumn(
+                    "Jednatel", display_text="⚖️ Otevřít"
+                )
+            },
         )
+    else:
+        st.warning("No IČO (company registration number) found.", icon="⚠️")
 
     if pages_ok == 0:
-        st.error(
-            "❌ Could not reach the site at all — it may be blocking automated "
-            "requests, be temporarily down, or the URL may be incorrect."
-        )
+        st.error("❌ Site unreachable - it may be blocking automated requests or down.")
 
-    # Transparency: show which pages failed and why, without being alarming.
+    # Errors go in a collapsed expander so they never take up space
+    # unless the user actually wants to see them.
     if errors:
-        with st.expander(f"ℹ️ {len(errors)} page(s) could not be checked"):
+        with st.expander(f"{len(errors)} page(s) could not be checked"):
             for page_url, error_msg in errors:
-                st.write(f"- `{page_url}` → {error_msg}")
+                st.caption(f"`{page_url}` → {error_msg}")
 
 elif submitted and not user_input:
-    st.warning("👆 Please enter a URL first.")
+    st.warning("👆 Enter a URL in the sidebar first.")
