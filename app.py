@@ -88,21 +88,73 @@ SUBPAGES_TO_TRY = [
 #   - optional international prefix: +420 / 00420 / +421 / 00421
 #   - optional spaces (or no spaces at all) between digit groups
 #   - the classic 9-digit CZ/SK national number, split as 3-3-3
+# (?<!\d) / (?!\d) boundaries stop it from matching a 9-digit slice out of
+# a longer digit run (order numbers, EANs, tracking codes, etc.) - without
+# these, a 13-digit barcode would happily yield a fake "phone number".
 PHONE_REGEX = re.compile(
     r"""
+    (?<!\d)
     (?:                                  # optional international prefix
         (?:\+|00)
         (?:420|421)
         [\s.-]?
     )?
-    (?:                                  # the 9-digit national number,
-        \d{3}[\s.-]?\d{3}[\s.-]?\d{3}    # written as 3-3-3 groups...
-        |
-        \d{9}                            # ...or with no separators at all
-    )
+    \d{3}[\s.-]?\d{3}[\s.-]?\d{3}        # 9-digit national number, with or
+                                          # without 3-3-3 separators
+    (?!\d)
     """,
     re.VERBOSE,
 )
+
+# Real Czech/Slovak phone numbers never start with 0 or 1 (those digits are
+# reserved for other numbering purposes), so any "match" whose 9-digit body
+# starts with 0/1 is a false positive (order number, zip+something, etc.)
+# rather than an actual phone number.
+INVALID_PHONE_START_DIGITS = ("0", "1")
+
+# When a candidate number has neither a country-code prefix nor any spacing
+# (i.e. it's a bare, unbroken run of 9 digits), it's too easy to confuse
+# with an SKU, order number, or other ID. We only accept those if one of
+# these phone-related words appears shortly before it in the text.
+PHONE_CONTEXT_KEYWORDS = (
+    "tel", "telefon", "mobil", "kontakt", "linka", "volejte",
+    "zavolejte", "phone", "call", "fax",
+)
+PHONE_CONTEXT_WINDOW = 15  # characters to look back for a keyword
+
+
+def normalize_phone_number(raw_match: str):
+    """
+    Turn any raw regex match (with any mix of spaces/dots/dashes, with or
+    without a country prefix) into one canonical string:
+        '+420 123 456 789'  or  '+421 123 456 789'
+
+    Returns None if the digits don't actually form a valid-looking CZ/SK
+    number (wrong length after stripping the country code, or a national
+    number starting with 0/1, which real numbers never do).
+    """
+    digits = re.sub(r"\D", "", raw_match)
+
+    # Normalize the "00" international dialing prefix to look like the
+    # digits after a '+', e.g. "00420" behaves like "420" from here on.
+    if digits.startswith("00420") or digits.startswith("00421"):
+        digits = digits[2:]
+
+    if digits.startswith("420") and len(digits) == 12:
+        country_code, national_number = "420", digits[3:]
+    elif digits.startswith("421") and len(digits) == 12:
+        country_code, national_number = "421", digits[3:]
+    elif len(digits) == 9:
+        # No explicit country code in the text - default to Czech (+420),
+        # since that's this tool's primary market.
+        country_code, national_number = "420", digits
+    else:
+        return None
+
+    if len(national_number) != 9 or national_number[0] in INVALID_PHONE_START_DIGITS:
+        return None
+
+    return f"+{country_code} {national_number[0:3]} {national_number[3:6]} {national_number[6:9]}"
 
 # Regex for the Czech IČO (Identifikační číslo osoby) - an 8-digit company
 # registration number, typically labelled "IČ", "IČO", "IC", or "ICO"
@@ -186,18 +238,37 @@ def build_facebook_ads_library_url(domain: str) -> str:
 
 def extract_phone_numbers(text: str) -> set:
     """
-    Run the phone regex over a blob of text and return a cleaned set of
-    matches (whitespace collapsed, so duplicates that differ only in
-    spacing get merged together).
+    Run the phone regex over a blob of text and return a set of
+    de-duplicated, canonically-formatted numbers ('+420 123 456 789').
+
+    Because everything is normalized to the same format before going into
+    the set, the same number written three different ways on a page
+    (e.g. '+420123456789', '420 123 456 789', '123456789') collapses into
+    a single entry instead of showing up as three "different" numbers.
+
+    Bare 9-digit runs with no country code and no separators (the kind
+    most likely to actually be an order number or SKU) are only accepted
+    if a phone-related word appears shortly before them in the text.
     """
     found = set()
-    for match in PHONE_REGEX.findall(text):
-        cleaned = re.sub(r"\s+", " ", match).strip()
-        # Guard against grabbing short junk (e.g. stray "123" from a date
-        # or an ID) - a real CZ/SK number always has at least 9 digits.
-        digit_count = len(re.sub(r"\D", "", cleaned))
-        if digit_count >= 9:
-            found.add(cleaned)
+    lower_text = text.lower()
+
+    for match in PHONE_REGEX.finditer(text):
+        raw = match.group(0)
+
+        has_prefix = bool(re.match(r"(?:\+|00)(?:420|421)", raw.strip()))
+        has_separator = bool(re.search(r"[\s.\-]", raw.strip()))
+
+        if not has_prefix and not has_separator:
+            window_start = max(0, match.start() - PHONE_CONTEXT_WINDOW)
+            context = lower_text[window_start:match.start()]
+            if not any(keyword in context for keyword in PHONE_CONTEXT_KEYWORDS):
+                continue  # looks like a random 9-digit ID, not a phone number
+
+        normalized = normalize_phone_number(raw)
+        if normalized:
+            found.add(normalized)
+
     return found
 
 
