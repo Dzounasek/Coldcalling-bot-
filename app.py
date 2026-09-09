@@ -11,13 +11,17 @@ cold call to an e-shop by:
      pages, looking up the official company name via the ARES API, and
      linking straight to the Justice.cz public register for owner/director
      ("jednatel") details.
+  4. Sending the homepage text to Google Gemini for an AI-generated,
+     Czech-language cold-calling assessment: weaknesses, a lead-potential
+     score, and a tailored icebreaker question.
 
 Designed to run on Streamlit Community Cloud: no heavy dependencies,
-generous timeouts, and every network call is wrapped so a single bad
-website (or a flaky government API) can never crash the whole app.
+generous timeouts, and every network call (including the Gemini API) is
+wrapped so a single bad website, a flaky government API, or an invalid
+API key can never crash the whole app.
 
 Layout is intentionally linear (single column, top to bottom) so it's
-comfortable on small/older monitors with no horizontal scrolling.
+comfortable on small/older monitors with no scrolling.
 """
 
 import re
@@ -27,6 +31,7 @@ from urllib.parse import urlparse, urljoin, quote
 import requests
 import pandas as pd
 import streamlit as st
+import google.generativeai as genai
 from bs4 import BeautifulSoup
 
 
@@ -110,6 +115,31 @@ ARES_API_URL = "https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-sub
 # Czech Public Register (Justice.cz) search-by-IČO template - shows the
 # company record including statutory representatives ("jednatel").
 JUSTICE_URL_TEMPLATE = "https://or.justice.cz/ias/ui/rejstrik-$firma?ico={ico}"
+
+# The Gemini model used for the AI website evaluation. Flash is fast and
+# has a generous free tier, which matters since salespeople will run this
+# repeatedly throughout the day.
+GEMINI_MODEL_NAME = "gemini-1.5-flash"
+
+# Cap how much homepage text we send to Gemini. Keeps token usage (and
+# therefore latency/cost) predictable regardless of how bloated a page's
+# HTML is - a homepage's marketing copy is almost always within this.
+MAX_AI_INPUT_CHARS = 8000
+
+# The Czech-language cold-calling analysis prompt. The instruction to the
+# model is in Czech on purpose so its output naturally comes back in Czech
+# too, matching the house language of the sales team using this tool.
+AI_ANALYSIS_PROMPT_TEMPLATE = """Jsi expert na B2B marketing a cold calling. Analyzuj tento text z webových stránek potenciálního klienta (e-shopu) a vrať strukturované hodnocení:
+
+1. Slabiny a co jim chybí: 3 hlavní marketingové/prodejní chyby (např. chybí USP, špatný copywriting, žádné výzvy k akci, chybí trust signály).
+2. Hodnocení potenciálu (?/10): Ohodnoť od 1 do 10, jak moc dává smysl jim volat s nabídkou marketingových služeb (1 = ztráta času, 10 = okamžitě volat). Krátce zdůvodni proč.
+3. Icebreaker na míru: Napiš jednu trefnou otevírací otázku pro cold call, která vychází ze zjištěných slabin.
+
+Text webu:
+\"\"\"
+{website_text}
+\"\"\"
+"""
 
 
 # ----------------------------------------------------------------------------
@@ -221,11 +251,14 @@ def scrape_site_for_contact_info(base_url: str, domain: str):
     Visits the homepage plus a fixed list of common "contact" subpages,
     extracts visible text from each, and aggregates any phone numbers
     AND IČO company registration numbers found across all of them into
-    de-duplicated sets.
+    de-duplicated sets. Also hangs on to the homepage's visible text
+    separately, since that's what gets sent to the AI evaluation step.
 
     Returns:
         all_numbers (set): every unique phone number found
         all_icos (set): every unique 8-digit IČO found
+        homepage_text (str): visible text of the homepage only, or ""
+                              if the homepage itself could not be fetched
         page_errors (list of tuples): (url, error_message) for pages that
                                        failed to load, so we can be
                                        transparent with the user
@@ -233,6 +266,7 @@ def scrape_site_for_contact_info(base_url: str, domain: str):
     """
     all_numbers = set()
     all_icos = set()
+    homepage_text = ""
     page_errors = []
     pages_checked = 0
 
@@ -251,11 +285,14 @@ def scrape_site_for_contact_info(base_url: str, domain: str):
         all_numbers.update(extract_phone_numbers(visible_text))
         all_icos.update(extract_ico_numbers(visible_text))
 
+        if page_url == base_url:
+            homepage_text = visible_text
+
         # Small, polite delay between requests so we don't hammer the
         # target site like a bot storm.
         time.sleep(0.3)
 
-    return all_numbers, all_icos, page_errors, pages_checked
+    return all_numbers, all_icos, homepage_text, page_errors, pages_checked
 
 
 def lookup_company_name_ares(ico: str):
@@ -292,6 +329,41 @@ def build_justice_url(ico: str) -> str:
     return JUSTICE_URL_TEMPLATE.format(ico=ico)
 
 
+def analyze_website_with_ai(text: str, api_key: str):
+    """
+    Send scraped website text to Google Gemini for a Czech-language B2B
+    cold-calling assessment: key weaknesses, a 1-10 lead-potential score
+    with justification, and a tailored icebreaker question.
+
+    Returns (analysis_text, error_message). Exactly one of the two will
+    be None. Never raises - an invalid/missing API key, a quota error, a
+    network hiccup, or any other Gemini SDK exception is caught and
+    turned into a friendly message so it can never crash the app.
+    """
+    if not text.strip():
+        return None, "Není k dispozici žádný text webu k analýze."
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+
+        # Truncate to keep token usage (and latency) predictable.
+        trimmed_text = text[:MAX_AI_INPUT_CHARS]
+        prompt = AI_ANALYSIS_PROMPT_TEMPLATE.format(website_text=trimmed_text)
+
+        response = model.generate_content(prompt)
+
+        if response and getattr(response, "text", None):
+            return response.text, None
+        return None, "Gemini nevrátil žádnou odpověď (možná zablokováno bezpečnostním filtrem)."
+
+    except Exception as exc:
+        # Broad catch is intentional here: the Gemini SDK can raise many
+        # different exception types (invalid key, quota exceeded, network
+        # errors, etc.) and we want all of them handled the same safe way.
+        return None, f"Chyba při volání Gemini API: {exc}"
+
+
 # ----------------------------------------------------------------------------
 # SIDEBAR - INPUT ONLY
 # ----------------------------------------------------------------------------
@@ -301,13 +373,25 @@ def build_justice_url(ico: str) -> str:
 
 with st.sidebar:
     st.header("📞 Cold Call Ninja")
+
+    # --- Gemini API key, at the very top before anything else -----------
+    gemini_api_key = st.text_input(
+        "Gemini API klíč",
+        type="password",
+        placeholder="AIza...",
+        help="Váš klíč se nikam neukládá, používá se jen pro tuto relaci.",
+    )
+    st.caption(
+        "Zdarma klíč získáte na [Google AI Studio](https://aistudio.google.com/apikey)."
+    )
+
     user_input = st.text_input(
         "E-shop URL",
         placeholder="alza.cz",
         help="e.g., alza.cz or https://www.alza.cz",
         label_visibility="collapsed",
     )
-    submitted = st.button("🚀 Prep this call", type="primary", use_container_width=True)
+    submitted = st.button("🚀 Analyzovat", type="primary", use_container_width=True)
 
 # ----------------------------------------------------------------------------
 # MAIN AREA - COMPACT, EVERYTHING ON ONE SCREEN, NO SCROLLING
@@ -316,7 +400,19 @@ with st.sidebar:
 # giant success/info box per item. Results are packed into small tables
 # so a full lookup fits on-screen without needing to scroll at all.
 
-if user_input and submitted:
+if submitted:
+
+    # --- VALIDATION ------------------------------------------------------
+    # Check the API key first (per spec), then the URL. Both stop the
+    # script immediately with a clear warning rather than proceeding
+    # half-configured.
+    if not gemini_api_key:
+        st.warning("🔑 Nejprve zadejte do postranního panelu váš Gemini API klíč.")
+        st.stop()
+
+    if not user_input:
+        st.warning("👆 Zadejte URL e-shopu v postranním panelu.")
+        st.stop()
 
     # --- URL PROCESSING -----------------------------------------------
     full_url = normalize_url(user_input)
@@ -334,16 +430,18 @@ if user_input and submitted:
     fb_url = build_facebook_ads_library_url(domain)
     st.link_button("🔎 Facebook Ads Library", fb_url, use_container_width=True)
 
-    # --- CRAWL FOR PHONES + IČO -----------------------------------------
+    # --- CRAWL FOR PHONES + IČO + HOMEPAGE TEXT --------------------------
     with st.spinner(f"Scanning {domain}..."):
         try:
-            numbers, icos, errors, pages_ok = scrape_site_for_contact_info(full_url, domain)
+            numbers, icos, homepage_text, errors, pages_ok = scrape_site_for_contact_info(
+                full_url, domain
+            )
         except Exception as exc:
             # Absolute last-resort safety net - should rarely trigger
             # since fetch_page() already catches network errors, but
             # this guarantees the app never crashes outright.
             st.error(f"❌ Unexpected error while scraping: {exc}")
-            numbers, icos, errors, pages_ok = set(), set(), [], 0
+            numbers, icos, homepage_text, errors, pages_ok = set(), set(), "", [], 0
 
     # --- PHONE NUMBERS: one compact table instead of a box per number ---
     if numbers:
@@ -392,5 +490,19 @@ if user_input and submitted:
             for page_url, error_msg in errors:
                 st.caption(f"`{page_url}` → {error_msg}")
 
-elif submitted and not user_input:
-    st.warning("👆 Enter a URL in the sidebar first.")
+    # --- SECTION 3: AI WEBSITE EVALUATION --------------------------------
+    st.subheader("3. AI Zhodnocení Webu")
+
+    if not homepage_text:
+        st.warning(
+            "⚠️ Nepodařilo se stáhnout text hlavní stránky, AI analýzu proto "
+            "nelze provést."
+        )
+    else:
+        with st.spinner("Umělá inteligence čte web a hledá slabiny..."):
+            analysis, ai_error = analyze_website_with_ai(homepage_text, gemini_api_key)
+
+        if analysis:
+            st.info(analysis)
+        else:
+            st.error(f"❌ {ai_error}")
