@@ -181,6 +181,19 @@ GEMINI_MODEL_NAME = "gemini-flash-latest"
 # HTML is - a homepage's marketing copy is almost always within this.
 MAX_AI_INPUT_CHARS = 8000
 
+# How many times to retry a Gemini call if it fails with a transient
+# "model overloaded" (503) error, and how long to pause between tries.
+# These are almost always brief demand spikes on Google's side that clear
+# up within seconds, so a couple of quick retries usually succeeds
+# without the user having to click anything again.
+GEMINI_MAX_RETRIES = 3
+GEMINI_RETRY_DELAY_SECONDS = 2
+
+# Substrings that identify a transient/overload error worth retrying, as
+# opposed to a permanent failure (bad API key, invalid model name, etc.)
+# that would just fail the exact same way on every retry.
+TRANSIENT_ERROR_MARKERS = ("503", "UNAVAILABLE", "overloaded", "high demand")
+
 # The Czech-language cold-calling analysis prompt. The instruction to the
 # model is in Czech on purpose so its output naturally comes back in Czech
 # too, matching the house language of the sales team using this tool.
@@ -413,6 +426,10 @@ def analyze_website_with_ai(text: str, api_key: str):
     package is deprecated and its short model-name aliases increasingly
     point at retired models).
 
+    Automatically retries a couple of times if Gemini responds with a
+    transient "model overloaded" (503) error, since those usually clear
+    up within seconds on their own.
+
     Returns (analysis_text, error_message). Exactly one of the two will
     be None. Never raises - an invalid/missing API key, a quota error, a
     network hiccup, or any other Gemini SDK exception is caught and
@@ -421,27 +438,51 @@ def analyze_website_with_ai(text: str, api_key: str):
     if not text.strip():
         return None, "Není k dispozici žádný text webu k analýze."
 
-    try:
-        client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key)
 
-        # Truncate to keep token usage (and latency) predictable.
-        trimmed_text = text[:MAX_AI_INPUT_CHARS]
-        prompt = AI_ANALYSIS_PROMPT_TEMPLATE.format(website_text=trimmed_text)
+    # Truncate to keep token usage (and latency) predictable.
+    trimmed_text = text[:MAX_AI_INPUT_CHARS]
+    prompt = AI_ANALYSIS_PROMPT_TEMPLATE.format(website_text=trimmed_text)
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL_NAME,
-            contents=prompt,
-        )
+    last_error = None
 
-        if response and getattr(response, "text", None):
-            return response.text, None
-        return None, "Gemini nevrátil žádnou odpověď (možná zablokováno bezpečnostním filtrem)."
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=prompt,
+            )
 
-    except Exception as exc:
-        # Broad catch is intentional here: the Gemini SDK can raise many
-        # different exception types (invalid key, quota exceeded, network
-        # errors, etc.) and we want all of them handled the same safe way.
-        return None, f"Chyba při volání Gemini API: {exc}"
+            if response and getattr(response, "text", None):
+                return response.text, None
+
+            last_error = "Gemini nevrátil žádnou odpověď (možná zablokováno bezpečnostním filtrem)."
+            break  # not a transient error - no point retrying
+
+        except Exception as exc:
+            error_text = str(exc)
+            is_transient = any(marker in error_text for marker in TRANSIENT_ERROR_MARKERS)
+
+            if is_transient and attempt < GEMINI_MAX_RETRIES:
+                last_error = f"Gemini je dočasně přetížený (pokus {attempt}/{GEMINI_MAX_RETRIES})..."
+                time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+                continue
+
+            # Either a permanent error, or we've used up all retries.
+            if is_transient:
+                last_error = (
+                    "Gemini je momentálně přetížený a nereaguje. "
+                    "Zkuste to prosím za chvíli znovu."
+                )
+            else:
+                # Broad catch is intentional here: the Gemini SDK can raise
+                # many different exception types (invalid key, quota
+                # exceeded, network errors, etc.) and we want all of them
+                # handled the same safe way.
+                last_error = f"Chyba při volání Gemini API: {exc}"
+            break
+
+    return None, last_error
 
 
 # ----------------------------------------------------------------------------
@@ -562,13 +603,6 @@ if submitted:
 
     if pages_ok == 0:
         st.error("❌ Site unreachable - it may be blocking automated requests or down.")
-
-    # Errors go in a collapsed expander so they never take up space
-    # unless the user actually wants to see them.
-    if errors:
-        with st.expander(f"{len(errors)} page(s) could not be checked"):
-            for page_url, error_msg in errors:
-                st.caption(f"`{page_url}` → {error_msg}")
 
     # --- SECTION 3: AI WEBSITE EVALUATION --------------------------------
     st.subheader("3. AI Zhodnocení Webu")
