@@ -119,7 +119,7 @@ JUSTICE_URL_TEMPLATE = "https://or.justice.cz/ias/ui/rejstrik-$firma?ico={ico}"
 # The Gemini model used for the AI website evaluation. Flash is fast and
 # has a generous free tier, which matters since salespeople will run this
 # repeatedly throughout the day.
-GEMINI_MODEL_NAME = "gemini-1.5-flash"
+GEMINI_MODEL_NAME = "gemini-1.5-flash-latest"
 
 # Cap how much homepage text we send to Gemini. Keeps token usage (and
 # therefore latency/cost) predictable regardless of how bloated a page's
