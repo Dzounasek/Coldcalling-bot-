@@ -31,7 +31,7 @@ from urllib.parse import urlparse, urljoin, quote
 import requests
 import pandas as pd
 import streamlit as st
-import google.generativeai as genai
+from google import genai
 from bs4 import BeautifulSoup
 
 
@@ -116,10 +116,13 @@ ARES_API_URL = "https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-sub
 # company record including statutory representatives ("jednatel").
 JUSTICE_URL_TEMPLATE = "https://or.justice.cz/ias/ui/rejstrik-$firma?ico={ico}"
 
-# The Gemini model used for the AI website evaluation. Flash is fast and
-# has a generous free tier, which matters since salespeople will run this
-# repeatedly throughout the day.
-GEMINI_MODEL_NAME = "gemini-1.5-flash-latest"
+# The Gemini model used for the AI website evaluation. "gemini-flash-latest"
+# is an alias Google maintains that always points at their current Flash
+# model - Google gives ~2 weeks notice before swapping what's behind it.
+# We deliberately avoid pinning a specific dated version (e.g. "gemini-1.5-
+# flash") since Google regularly retires older model versions outright,
+# which turns a pinned name into a hard 404 with no warning.
+GEMINI_MODEL_NAME = "gemini-flash-latest"
 
 # Cap how much homepage text we send to Gemini. Keeps token usage (and
 # therefore latency/cost) predictable regardless of how bloated a page's
@@ -335,6 +338,10 @@ def analyze_website_with_ai(text: str, api_key: str):
     cold-calling assessment: key weaknesses, a 1-10 lead-potential score
     with justification, and a tailored icebreaker question.
 
+    Uses the new unified google-genai SDK (the older google-generativeai
+    package is deprecated and its short model-name aliases increasingly
+    point at retired models).
+
     Returns (analysis_text, error_message). Exactly one of the two will
     be None. Never raises - an invalid/missing API key, a quota error, a
     network hiccup, or any other Gemini SDK exception is caught and
@@ -344,14 +351,16 @@ def analyze_website_with_ai(text: str, api_key: str):
         return None, "Není k dispozici žádný text webu k analýze."
 
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+        client = genai.Client(api_key=api_key)
 
         # Truncate to keep token usage (and latency) predictable.
         trimmed_text = text[:MAX_AI_INPUT_CHARS]
         prompt = AI_ANALYSIS_PROMPT_TEMPLATE.format(website_text=trimmed_text)
 
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=prompt,
+        )
 
         if response and getattr(response, "text", None):
             return response.text, None
